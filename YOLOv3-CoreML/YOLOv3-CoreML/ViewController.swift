@@ -7,7 +7,6 @@ import VideoToolbox
 class ViewController: UIViewController {
   @IBOutlet weak var videoPreview: UIView!
   @IBOutlet weak var timeLabel: UILabel!
-  @IBOutlet weak var debugImageView: UIImageView!
 
   let yolo = YOLO()
 
