@@ -1,10 +1,12 @@
-# YOLOv3 with Core ML
+# YOLOv3 with CoreML and ARKit
 
 This repo was forked and modified from [hollance/YOLO-CoreML-MPSNNGraph](https://github.com/hollance/YOLO-CoreML-MPSNNGraph). Some changes I made:
 
 1. Add YOLOv3 model.
 2. Only keep Keras converter.
 
+## Demo
+![Demo](demo_ar_yolo.gif)
 
 ## About YOLO object detection
 
