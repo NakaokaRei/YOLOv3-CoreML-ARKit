@@ -3,12 +3,17 @@ import Vision
 import AVFoundation
 import CoreMedia
 import VideoToolbox
+import ARKit
+import SceneKit
 
-class ViewController: UIViewController {
-    @IBOutlet weak var videoPreview: UIView!
-    @IBOutlet weak var timeLabel: UILabel!
+class ViewController: UIViewController, ARSCNViewDelegate {
+
+    // SCENE
+    @IBOutlet var sceneView: ARSCNView!
+    let bubbleDepth : Float = 0.01 // the 'depth' of 3D text
 
     let yolo = YOLO()
+    let dispatchQueueML = DispatchQueue(label: "com.rei.nakaoka")
 
     var videoCapture: VideoCapture!
     var request: VNCoreMLRequest!
@@ -27,14 +32,19 @@ class ViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        timeLabel.text = ""
-
         setUpBoundingBoxes()
         setUpCoreImage()
-        setUpVision()
-        setUpCamera()
+        setUpSceanView()
+        setUpARSession()
 
         frameCapturingStartTime = CACurrentMediaTime()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+
+        // Pause the view's session
+        sceneView.session.pause()
     }
 
     override func didReceiveMemoryWarning() {
@@ -43,6 +53,31 @@ class ViewController: UIViewController {
     }
 
     // MARK: - Initialization
+
+    func setUpSceanView() {
+        // Set the view's delegate
+        sceneView.delegate = self
+        sceneView.session.delegate = self
+
+        // Show statistics such as fps and timing information
+        sceneView.showsStatistics = true
+        sceneView.debugOptions = [ARSCNDebugOptions.showFeaturePoints]
+
+        // Create a new scene
+        let scene = SCNScene()
+
+        // Set the scene to the view
+        sceneView.scene = scene
+    }
+
+    func setUpARSession() {
+        // Create a session configuration
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.planeDetection = .horizontal
+
+        // Run the view's session
+        sceneView.session.run(configuration)
+    }
 
     func setUpBoundingBoxes() {
         for _ in 0..<YOLO.maxBoundingBoxes {
@@ -70,75 +105,20 @@ class ViewController: UIViewController {
         }
     }
 
-    func setUpVision() {
-        guard let visionModel = try? VNCoreMLModel(for: yolo.model.model) else {
-            print("Error: could not create Vision model")
-            return
-        }
-
-        request = VNCoreMLRequest(model: visionModel, completionHandler: visionRequestDidComplete)
-
-        // NOTE: If you choose another crop/scale option, then you must also
-        // change how the BoundingBox objects get scaled when they are drawn.
-        // Currently they assume the full input image is used.
-        request.imageCropAndScaleOption = .scaleFill
-    }
-
-    func setUpCamera() {
-        videoCapture = VideoCapture()
-        videoCapture.delegate = self
-        videoCapture.fps = 50
-        videoCapture.setUp(sessionPreset: AVCaptureSession.Preset.vga640x480) { success in
-            if success {
-                // Add the video preview into the UI.
-                if let previewLayer = self.videoCapture.previewLayer {
-                    self.videoPreview.layer.addSublayer(previewLayer)
-                    self.resizePreviewLayer()
-                }
-
-                // Add the bounding box layers to the UI, on top of the video preview.
-                for box in self.boundingBoxes {
-                    box.addToLayer(self.videoPreview.layer)
-                }
-
-                // Once everything is set up, we can start capturing live video.
-                self.videoCapture.start()
-            }
-        }
-    }
-
     // MARK: - UI stuff
-
-    override func viewWillLayoutSubviews() {
-        super.viewWillLayoutSubviews()
-        resizePreviewLayer()
-    }
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
         return .lightContent
     }
 
-    func resizePreviewLayer() {
-        videoCapture.previewLayer?.frame = videoPreview.bounds
-    }
-
     // MARK: - Doing inference
 
-    func predict(image: UIImage) {
-        if let pixelBuffer = image.pixelBuffer(width: YOLO.inputWidth, height: YOLO.inputHeight) {
-            predict(pixelBuffer: pixelBuffer)
-        }
-    }
-
-    func predict(pixelBuffer: CVPixelBuffer) {
-        // Measure how long it takes to predict a single video frame.
-        let startTime = CACurrentMediaTime()
+    func predict(ciImage: CIImage) -> [YOLO.Prediction] {
 
         // Resize the input with Core Image to 416x416.
-        guard let resizedPixelBuffer = resizedPixelBuffer else { return }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let sx = CGFloat(YOLO.inputWidth) / CGFloat(CVPixelBufferGetWidth(pixelBuffer))
-        let sy = CGFloat(YOLO.inputHeight) / CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        guard let resizedPixelBuffer = resizedPixelBuffer else { return [] }
+        let sx = CGFloat(YOLO.inputWidth) / CGFloat(ciImage.extent.width)
+        let sy = CGFloat(YOLO.inputHeight) / CGFloat(ciImage.extent.height)
         let scaleTransform = CGAffineTransform(scaleX: sx, y: sy)
         let scaledImage = ciImage.transformed(by: scaleTransform)
         ciContext.render(scaledImage, to: resizedPixelBuffer)
@@ -150,75 +130,67 @@ class ViewController: UIViewController {
 
         // Resize the input to 416x416 and give it to our model.
         if let boundingBoxes = try? yolo.predict(image: resizedPixelBuffer) {
-            let elapsed = CACurrentMediaTime() - startTime
-            showOnMainThread(boundingBoxes, elapsed)
+            return boundingBoxes
+        } else {
+            return []
         }
     }
 
-    func predictUsingVision(pixelBuffer: CVPixelBuffer) {
-        // Measure how long it takes to predict a single video frame. Note that
-        // predict() can be called on the next frame while the previous one is
-        // still being processed. Hence the need to queue up the start times.
-        startTimes.append(CACurrentMediaTime())
+    func createNewBubbleParentNode(_ text : String) -> SCNNode {
+        // Warning: Creating 3D Text is susceptible to crashing. To reduce chances of crashing; reduce number of polygons, letters, smoothness, etc.
 
-        // Vision will automatically resize the input image.
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer)
-        try? handler.perform([request])
+        // TEXT BILLBOARD CONSTRAINT
+        let billboardConstraint = SCNBillboardConstraint()
+        billboardConstraint.freeAxes = SCNBillboardAxis.Y
+
+        // BUBBLE-TEXT
+        let bubble = SCNText(string: text, extrusionDepth: CGFloat(bubbleDepth))
+        var font = UIFont(name: "Futura", size: 0.15)
+        font = font?.withTraits(traits: .traitBold)
+        bubble.font = font
+        bubble.alignmentMode = kCAAlignmentCenter
+        bubble.firstMaterial?.diffuse.contents = UIColor.orange
+        bubble.firstMaterial?.specular.contents = UIColor.white
+        bubble.firstMaterial?.isDoubleSided = true
+        // bubble.flatness // setting this too low can cause crashes.
+        bubble.chamferRadius = CGFloat(bubbleDepth)
+
+        // BUBBLE NODE
+        let (minBound, maxBound) = bubble.boundingBox
+        let bubbleNode = SCNNode(geometry: bubble)
+        // Centre Node - to Centre-Bottom point
+        bubbleNode.pivot = SCNMatrix4MakeTranslation( (maxBound.x - minBound.x)/2, minBound.y, bubbleDepth/2)
+        // Reduce default text size
+        bubbleNode.scale = SCNVector3Make(0.2, 0.2, 0.2)
+
+        // CENTRE POINT NODE
+        let sphere = SCNSphere(radius: 0.005)
+        sphere.firstMaterial?.diffuse.contents = UIColor.cyan
+        let sphereNode = SCNNode(geometry: sphere)
+
+        // BUBBLE PARENT NODE
+        let bubbleNodeParent = SCNNode()
+        bubbleNodeParent.addChildNode(bubbleNode)
+        bubbleNodeParent.addChildNode(sphereNode)
+        bubbleNodeParent.constraints = [billboardConstraint]
+
+        return bubbleNodeParent
     }
 
-    func visionRequestDidComplete(request: VNRequest, error: Error?) {
-        if let observations = request.results as? [VNCoreMLFeatureValueObservation],
-           let features = observations.first?.featureValue.multiArrayValue {
-
-            let boundingBoxes = yolo.computeBoundingBoxes(features: [features, features, features])
-            let elapsed = CACurrentMediaTime() - startTimes.remove(at: 0)
-            showOnMainThread(boundingBoxes, elapsed)
-        }
-    }
-
-    func showOnMainThread(_ boundingBoxes: [YOLO.Prediction], _ elapsed: CFTimeInterval) {
-        DispatchQueue.main.async {
-            // For debugging, to make sure the resized CVPixelBuffer is correct.
-            //var debugImage: CGImage?
-            //VTCreateCGImageFromCVPixelBuffer(resizedPixelBuffer, nil, &debugImage)
-            //self.debugImageView.image = UIImage(cgImage: debugImage!)
-
-            self.show(predictions: boundingBoxes)
-
-            let fps = self.measureFPS()
-            self.timeLabel.text = String(format: "Elapsed %.5f seconds - %.2f FPS", elapsed, fps)
-
-            self.semaphore.signal()
-        }
-    }
-
-    func measureFPS() -> Double {
-        // Measure how many frames were actually delivered per second.
-        framesDone += 1
-        let frameCapturingElapsed = CACurrentMediaTime() - frameCapturingStartTime
-        let currentFPSDelivered = Double(framesDone) / frameCapturingElapsed
-        if frameCapturingElapsed > 1 {
-            framesDone = 0
-            frameCapturingStartTime = CACurrentMediaTime()
-        }
-        return currentFPSDelivered
-    }
-
-    func show(predictions: [YOLO.Prediction]) {
+    func showBubbleLabel(predictions: [YOLO.Prediction]) {
+        removeAllNode()
         for i in 0..<boundingBoxes.count {
             if i < predictions.count {
                 let prediction = predictions[i]
 
-                // The predicted bounding box is in the coordinate space of the input
-                // image, which is a square image of 416x416 pixels. We want to show it
-                // on the video preview, which is as wide as the screen and has a 4:3
-                // aspect ratio. The video preview also may be letterboxed at the top
-                // and bottom.
-                let width = view.bounds.width
-                let height = width * 4 / 3
+                let label = String(format: "%@ %.1f", labels[prediction.classIndex], prediction.score * 100)
+                let bubbleNodeParent = createNewBubbleParentNode(label)
+
+                let width = sceneView.bounds.width
+                let height = sceneView.bounds.height
                 let scaleX = width / CGFloat(YOLO.inputWidth)
                 let scaleY = height / CGFloat(YOLO.inputHeight)
-                let top = (view.bounds.height - height) / 2
+                let top = (sceneView.bounds.height - height) / 2
 
                 // Translate and scale the rectangle to our own coordinate system.
                 var rect = prediction.rect
@@ -228,32 +200,51 @@ class ViewController: UIViewController {
                 rect.size.width *= scaleX
                 rect.size.height *= scaleY
 
-                // Show the bounding box.
-                let label = String(format: "%@ %.1f", labels[prediction.classIndex], prediction.score * 100)
-                let color = colors[prediction.classIndex]
-                boundingBoxes[i].show(frame: rect, label: label, color: color)
-            } else {
-                boundingBoxes[i].hide()
+                // hitTest
+                guard let query = sceneView.raycastQuery(from: .init(x: CGFloat(rect.midX), y: CGFloat(rect.midY)), allowing: .existingPlaneGeometry, alignment: .any) else { return }
+                let results = sceneView.session.raycast(query)
+                guard let hitTestResult = results.first else {
+                    print("no surface found")
+                    return
+                }
+
+                bubbleNodeParent.position = SCNVector3Make(hitTestResult.worldTransform.columns.3.x, hitTestResult.worldTransform.columns.3.y, hitTestResult.worldTransform.columns.3.z)
+                DispatchQueue.main.async {
+                    self.sceneView.scene.rootNode.addChildNode(bubbleNodeParent)
+                }
+            }
+        }
+    }
+
+    func removeAllNode() {
+        sceneView.scene.rootNode.enumerateChildNodes { (node, stop) in
+            node.removeFromParentNode()
+        }
+    }
+
+}
+
+extension ViewController: ARSessionDelegate {
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let pixelBuffer = frame.capturedImage
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer, options: [:]).oriented(.right)
+        let aspect =  sceneView.bounds.width / sceneView.bounds.height
+        let widthForDisplayAspect = ciImage.extent.height * aspect
+        let cropped = ciImage.cropped(to: CGRect(x: ciImage.extent.width/2-widthForDisplayAspect/2, y: 0, width: widthForDisplayAspect, height: ciImage.extent.height))
+
+        dispatchQueueML.async {
+            let prediction = self.predict(ciImage: cropped)
+            DispatchQueue.main.async {
+                self.showBubbleLabel(predictions: prediction)
             }
         }
     }
 }
 
-extension ViewController: VideoCaptureDelegate {
-    func videoCapture(_ capture: VideoCapture, didCaptureVideoFrame pixelBuffer: CVPixelBuffer?, timestamp: CMTime) {
-        // For debugging.
-        //predict(image: UIImage(named: "dog416")!); return
-
-        semaphore.wait()
-
-        if let pixelBuffer = pixelBuffer {
-            // For better throughput, perform the prediction on a background queue
-            // instead of on the VideoCapture queue. We use the semaphore to block
-            // the capture queue and drop frames when Core ML can't keep up.
-            DispatchQueue.global().async {
-                self.predict(pixelBuffer: pixelBuffer)
-                //self.predictUsingVision(pixelBuffer: pixelBuffer)
-            }
-        }
+extension UIFont {
+    // Based on: https://stackoverflow.com/questions/4713236/how-do-i-set-bold-and-italic-on-uilabel-of-iphone-ipad
+    func withTraits(traits:UIFontDescriptorSymbolicTraits...) -> UIFont {
+        let descriptor = self.fontDescriptor.withSymbolicTraits(UIFontDescriptorSymbolicTraits(traits))
+        return UIFont(descriptor: descriptor!, size: 0)
     }
 }
